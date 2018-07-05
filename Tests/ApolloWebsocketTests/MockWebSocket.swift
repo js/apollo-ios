@@ -2,6 +2,8 @@ import Starscream
 @testable import ApolloWebSocket
 
 class MockWebSocket: ApolloWebSocketClient {
+  var callbackQueue = DispatchQueue.main
+
   required init(request: URLRequest, protocols: [String]?) {
   }
   

@@ -90,11 +90,11 @@ class StarWarsSubscriptionTests: XCTestCase {
   
   func testSubscribeMultipleReviews() {
     let count = 50
-    let expectation = self.expectation(description: "Multiple reviews")
+    let expectation = self.expectation(description: "Multiple reviews subscription")
     expectation.expectedFulfillmentCount = count
 
     let sub = client.subscribe(subscription: ReviewAddedSubscription(episode: .empire)) { (result, error) in
-      if let error = error { XCTFail("Error while performing subscription: \(error.localizedDescription)");  return }
+      if let error = error { XCTFail("Error while performing subscription: \(error)");  return }
       guard let result = result else { XCTFail("No subscription result");  return }
 
       if let errors = result.errors {
@@ -102,14 +102,24 @@ class StarWarsSubscriptionTests: XCTestCase {
       }
 
       guard let data = result.data else { XCTFail("No subscription result data");  return }
-
       XCTAssertEqual(data.reviewAdded?.episode, .empire)
       expectation.fulfill()
     }
 
+    // wait for the websocket to finish connecting before we send data that will trigger the subscription above
+    // Should wait on isConnected() to become true instead
+    sleep(2)
+
+    let createExpectation = self.expectation(description: "Multiple reviews creation")
+    createExpectation.expectedFulfillmentCount = count
+
     for i in 1...count {
-      let review = ReviewInput(stars: i, commentary: "The greatest movie ever!")
-      _ = client.perform(mutation: CreateReviewForEpisodeMutation(episode: .empire, review: review))
+      let review = ReviewInput(stars: i, commentary: "is good")
+      let _ = client.perform(mutation: CreateReviewForEpisodeMutation(episode: .empire, review: review)) { (result, error) in
+        XCTAssert(error == nil)
+        XCTAssert(result?.errors == nil)
+        createExpectation.fulfill()
+      }
     }
 
     waitForExpectations(timeout: 10, handler: nil)

@@ -9,6 +9,7 @@ public class ApolloWebSocket: WebSocket, ApolloWebSocketClient {
 }
 
 public protocol ApolloWebSocketClient: WebSocketClient {
+  var callbackQueue: DispatchQueue { get set }
   init(request: URLRequest, protocols: [String]?)
 }
 
@@ -30,6 +31,8 @@ public class WebSocketTransport: NetworkTransport, WebSocketDelegate {
 
   private var subscribers = [String: (JSONObject?, Error?) -> Void]()
   private var subscriptions : [String: String] = [:]
+  private let processingQueue = DispatchQueue(label: "com.apollographql.websockets-callbacks")
+  private let lock = NSLock()
   
   private let sendOperationIdentifiers: Bool
   fileprivate var sequenceNumber = 0
@@ -40,13 +43,16 @@ public class WebSocketTransport: NetworkTransport, WebSocketDelegate {
     self.sendOperationIdentifiers = sendOperationIdentifiers
 
     self.websocket = WebSocketTransport.provider.init(request: request, protocols: protocols)
+    self.websocket.callbackQueue = processingQueue
     self.websocket.delegate = self
     self.websocket.connect()
   }
   
   public func send<Operation>(operation: Operation, completionHandler: @escaping (_ response: GraphQLResponse<Operation>?, _ error: Error?) -> Void) -> Cancellable {
-    if let error = self.error {
-      completionHandler(nil,error)
+    processingQueue.async {
+      if let error = self.error {
+        completionHandler(nil,error)
+      }
     }
     
     return WebSocketTask(self,operation) { (body, error) in
@@ -63,7 +69,7 @@ public class WebSocketTransport: NetworkTransport, WebSocketDelegate {
   public func isConnected() -> Bool {
     return websocket.isConnected
   }
-  
+
   private func processMessage(socket: WebSocketClient, text: String) {
     OperationMessage(serialized: text).parse { (type, id, payload, error) in
       guard let type = type, let messageType = OperationMessage.Types(rawValue: type) else {
@@ -73,7 +79,10 @@ public class WebSocketTransport: NetworkTransport, WebSocketDelegate {
 
       switch(messageType) {
       case .data, .error:
-        if let id = id, let responseHandler = subscribers[id] {
+        lock.lock()
+        let handler = id.flatMap { self.subscribers[$0] }
+        lock.unlock()
+        if let responseHandler = handler {
           responseHandler(payload,error)
         } else {
           notifyErrorAllHandlers(WebSocketError(payload: payload, error: error, kind: .unprocessedMessage(text)))
@@ -82,15 +91,22 @@ public class WebSocketTransport: NetworkTransport, WebSocketDelegate {
       case .complete:
         if let id = id {
           // remove the callback if NOT a subscription
+          lock.lock()
           if subscriptions[id] == nil {
             subscribers.removeValue(forKey: id)
           }
+          lock.unlock()
         } else {
           notifyErrorAllHandlers(WebSocketError(payload: payload, error: error, kind: .unprocessedMessage(text)))
         }
 
-      case .connectionAck, .connectionKeepAlive:
-        acked = (type == OperationMessage.Types.connectionAck.rawValue)
+      case .connectionAck:
+        lock.lock()
+        acked = true
+        lock.unlock()
+        writeQueue()
+
+      case .connectionKeepAlive:
         writeQueue()
 
       case .connectionInit, .connectionTerminate, .start, .stop, .connectionError:
@@ -106,14 +122,18 @@ public class WebSocketTransport: NetworkTransport, WebSocketDelegate {
   }
   
   private func writeQueue() {
+    lock.lock()
     guard !self.queue.isEmpty else {
+      lock.unlock()
       return
     }
 
     let queue = self.queue.sorted(by: { $0.0 < $1.0 })
     self.queue.removeAll()
+    lock.unlock()
+
     for (id, msg) in queue {
-      self.write(msg,id: id)
+      self.write(msg, id: id)
     }
   }
   
@@ -161,13 +181,14 @@ public class WebSocketTransport: NetworkTransport, WebSocketDelegate {
   }
   
   public func initServer(reconnect: Bool = true) {
+    lock.lock()
     self.reconnect = reconnect
     self.acked = false
+    lock.unlock()
     
     if let str = OperationMessage(payload: self.connectingPayload, type: .connectionInit).rawMessage {
-      write(str, force:true)
+      write(str, force: true)
     }
-    
   }
   
   public func closeConnection() {
@@ -180,18 +201,24 @@ public class WebSocketTransport: NetworkTransport, WebSocketDelegate {
   }
   
   private func write(_ str: String, force forced: Bool = false, id: Int? = nil) {
-    if websocket.isConnected && (acked || forced) {
+    lock.lock()
+    let isAcked = acked
+    lock.unlock()
+
+    if websocket.isConnected && (isAcked || forced) {
       websocket.write(string: str)
     } else {
+      lock.lock()
       // using sequence number to make sure that the queue is processed correctly
       // either using the earlier assigned id or with the next higher key
       if let id = id {
-        queue[id] = str
-      } else if let id = queue.keys.max() {
-        queue[id+1] = str
+        self.queue[id] = str
+      } else if let id = self.queue.keys.max() {
+        self.queue[id+1] = str
       } else {
-        queue[1] = str
+        self.queue[1] = str
       }
+      lock.unlock()
     }
   }
   
@@ -201,7 +228,9 @@ public class WebSocketTransport: NetworkTransport, WebSocketDelegate {
   }
   
   fileprivate func nextSequenceNumber() -> Int {
+    lock.lock()
     sequenceNumber += 1
+    lock.unlock()
     return sequenceNumber
   }
   
@@ -214,11 +243,13 @@ public class WebSocketTransport: NetworkTransport, WebSocketDelegate {
     }
 
     write(message)
-      
+
+    lock.lock()
     subscribers[sequenceNumber] = resultHandler
     if operation.operationType == .subscription {
       subscriptions[sequenceNumber] = message
     }
+    lock.unlock()
 
     return sequenceNumber
   }
@@ -235,10 +266,13 @@ public class WebSocketTransport: NetworkTransport, WebSocketDelegate {
   
   public func unsubscribe(_ subscriptionId: String) {
     if let str = OperationMessage(id: subscriptionId, type: .stop).rawMessage {
-      write(str)
+      self.write(str)
     }
-    subscribers.removeValue(forKey: subscriptionId)
-    subscriptions.removeValue(forKey: subscriptionId)
+
+    lock.lock()
+    self.subscribers.removeValue(forKey: subscriptionId)
+    self.subscriptions.removeValue(forKey: subscriptionId)
+    lock.unlock()
   }
   
   fileprivate final class WebSocketTask<Operation: GraphQLOperation> : Cancellable {
