@@ -71,47 +71,47 @@ public class WebSocketTransport: NetworkTransport, WebSocketDelegate {
   }
 
   private func processMessage(socket: WebSocketClient, text: String) {
-    OperationMessage(serialized: text).parse { (type, id, payload, error) in
-      guard let type = type, let messageType = OperationMessage.Types(rawValue: type) else {
-        notifyErrorAllHandlers(WebSocketError(payload: payload, error: error, kind: .unprocessedMessage(text)))
-        return
-      }
+    let (type, id, payload, error) = OperationMessage(serialized: text).parse()
 
-      switch(messageType) {
-      case .data, .error:
-        lock.lock()
-        let handler = id.flatMap { self.subscribers[$0] }
-        lock.unlock()
-        if let responseHandler = handler {
-          responseHandler(payload,error)
-        } else {
-          notifyErrorAllHandlers(WebSocketError(payload: payload, error: error, kind: .unprocessedMessage(text)))
-        }
+    guard let messageType = type else {
+      notifyErrorAllHandlers(WebSocketError(payload: payload, error: error, kind: .unprocessedMessage(text)))
+      return
+    }
 
-      case .complete:
-        if let id = id {
-          // remove the callback if NOT a subscription
-          lock.lock()
-          if subscriptions[id] == nil {
-            subscribers.removeValue(forKey: id)
-          }
-          lock.unlock()
-        } else {
-          notifyErrorAllHandlers(WebSocketError(payload: payload, error: error, kind: .unprocessedMessage(text)))
-        }
-
-      case .connectionAck:
-        lock.lock()
-        acked = true
-        lock.unlock()
-        writeQueue()
-
-      case .connectionKeepAlive:
-        writeQueue()
-
-      case .connectionInit, .connectionTerminate, .start, .stop, .connectionError:
+    switch(messageType) {
+    case .data, .error:
+      lock.lock()
+      let handler = id.flatMap { self.subscribers[$0] }
+      lock.unlock()
+      if let responseHandler = handler {
+        responseHandler(payload,error)
+      } else {
         notifyErrorAllHandlers(WebSocketError(payload: payload, error: error, kind: .unprocessedMessage(text)))
       }
+
+    case .complete:
+      if let id = id {
+        // remove the callback if NOT a subscription
+        lock.lock()
+        if subscriptions[id] == nil {
+          subscribers.removeValue(forKey: id)
+        }
+        lock.unlock()
+      } else {
+        notifyErrorAllHandlers(WebSocketError(payload: payload, error: error, kind: .unprocessedMessage(text)))
+      }
+
+    case .connectionAck:
+      lock.lock()
+      acked = true
+      lock.unlock()
+      writeQueue()
+
+    case .connectionKeepAlive:
+      writeQueue()
+
+    case .connectionInit, .connectionTerminate, .start, .stop, .connectionError:
+      notifyErrorAllHandlers(WebSocketError(payload: payload, error: error, kind: .unprocessedMessage(text)))
     }
   }
   
@@ -338,18 +338,16 @@ public class WebSocketTransport: NetworkTransport, WebSocketDelegate {
       self.serialized = serialized
     }
     
-    func parse(handler: (_ type: String?, _ id: String?, _ payload: JSONObject?, _ error: Error?) -> Void) {
+    func parse() -> (type: Types?, id: String?, payload: JSONObject?, error: Error?) {
       guard let serialized = self.serialized else {
-        handler(nil, nil, nil, WebSocketError(payload: nil, error: nil, kind: .serializedMessageError))
-        return
+        return (nil, nil, nil, WebSocketError(payload: nil, error: nil, kind: .serializedMessageError))
       }
 
       guard let data = self.serialized?.data(using: (.utf8) ) else {
-        handler(nil, nil, nil, WebSocketError(payload: nil, error: nil, kind: .unprocessedMessage(serialized)))
-        return
+        return (nil, nil, nil, WebSocketError(payload: nil, error: nil, kind: .unprocessedMessage(serialized)))
       }
 
-      var type : String?
+      var type : Types?
       var id : String?
       var payload : JSONObject?
 
@@ -357,13 +355,13 @@ public class WebSocketTransport: NetworkTransport, WebSocketDelegate {
         let json = try JSONSerializationFormat.deserialize(data: data ) as? JSONObject
 
         id = json?["id"] as? String
-        type = json?["type"] as? String
+        type = (json?["type"] as? String).flatMap(Types.init(rawValue:))
         payload = json?["payload"] as? JSONObject
 
-        handler(type,id,payload,nil)
+        return (type, id, payload, nil)
       }
       catch {
-        handler(type, id, payload, WebSocketError(payload: payload, error: error, kind: .unprocessedMessage(serialized)))
+        return (type, id, payload, WebSocketError(payload: payload, error: error, kind: .unprocessedMessage(serialized)))
       }
     }
   }
